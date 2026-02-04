@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>jarvis_agent</name>
+  <version>1.0.0</version>
+  <description>
+    Jarvis-Bot: An AI-powered mobile assistant robot with local LLM.
+    Translates natural language commands into robot actions using
+    ROS 2, MQTT, and local AI inference (Ollama).
+  </description>
+
+  <maintainer email="chris@example.com">Chris</maintainer>
+  <license>MIT</license>
+
+  <!-- Build dependencies -->
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- Runtime dependencies -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>turtlesim</exec_depend>
+
+  <!-- Python dependencies (installed via pip) -->
+  <!-- paho-mqtt: MQTT client -->
+  <!-- requests: HTTP client for Ollama API -->
+
+  <!-- Test dependencies -->
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
