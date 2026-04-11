@@ -10,14 +10,19 @@ import math
 import time
 import random
 import subprocess
+from collections import deque
 from datetime import datetime
-from typing import Optional
+from typing import Callable, List, Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from geometry_msgs.msg import Twist
 from turtlesim.msg import Pose
+
+# A single motion segment in the non-blocking motion queue.
+# (twist_to_publish, duration_seconds, optional_on_done_callback)
+MotionSegment = Tuple[Twist, float, Optional[Callable[[], None]]]
 
 
 class JarvisAgent(Node):
@@ -49,6 +54,24 @@ class JarvisAgent(Node):
         self.fake_battery = 100
         self.personality = "normal"
         self.follow_mode = False
+
+        # === Non-blocking motion state ===
+        # on_intent() must return immediately so that a later "stop" intent can
+        # be dispatched mid-motion. All motion execution therefore happens from
+        # a ROS timer that pops segments off this queue.
+        self._motion_queue: deque = deque()
+        self._current_twist: Optional[Twist] = None
+        self._motion_deadline: Optional[float] = None
+        self._current_on_done: Optional[Callable[[], None]] = None
+        self._need_idle_publish = False
+        # 50 Hz motion tick: high enough for smooth teleop, low enough to be cheap.
+        self._motion_timer = self.create_timer(0.02, self._motion_tick)
+
+        # === Non-blocking countdown state ===
+        # Countdown also used to sleep inside on_intent; now it's driven by a
+        # 1 Hz timer that is a no-op when _countdown_remaining == 0.
+        self._countdown_remaining = 0
+        self._countdown_timer = self.create_timer(1.0, self._countdown_tick)
         
         # === MEMORY SYSTEM ===
         self.memory = {
@@ -595,16 +618,24 @@ class JarvisAgent(Node):
         self._status("Told horoscope")
 
     def do_countdown(self, count_from: int):
-        """Do a countdown."""
+        """Start a non-blocking countdown driven by _countdown_tick."""
+        count_from = max(1, min(int(count_from), 60))
         self._speak(f"Counting down from {count_from}!")
-        for i in range(count_from, 0, -1):
-            if self.cancel_motion:
-                break
-            self._speak(str(i))
-            time.sleep(1)
-        if not self.cancel_motion:
-            self._speak("Blast off!")
+        self.cancel_motion = False
+        self._countdown_remaining = count_from
         self._status(f"Countdown from {count_from}")
+
+    def _countdown_tick(self):
+        """1 Hz timer: emit next number, or 'Blast off!' on the final tick."""
+        if self._countdown_remaining <= 0:
+            return  # idle
+        if self.cancel_motion:
+            self._countdown_remaining = 0
+            return
+        self._speak(str(self._countdown_remaining))
+        self._countdown_remaining -= 1
+        if self._countdown_remaining == 0:
+            self._speak("Blast off!")
 
     def do_math(self, num1: int, operator: str, num2: int):
         """Calculate math."""
@@ -899,9 +930,23 @@ class JarvisAgent(Node):
         self._speak(random.choice(feelings))
 
     # ==================== MOVEMENT COMMANDS ====================
+    #
+    # Motion execution is intentionally non-blocking: every execute_* method
+    # just builds a list of MotionSegments and hands them to _enqueue_motion.
+    # The actual publishing happens in _motion_tick (a ROS timer), so on_intent
+    # always returns in microseconds and a later "stop" intent can preempt an
+    # in-progress dance/patrol/figure-8 immediately.
 
     def execute_stop(self):
+        """Immediately cancel any running or queued motion and countdown."""
         self.cancel_motion = True
+        self._motion_queue.clear()
+        self._current_twist = None
+        self._motion_deadline = None
+        self._current_on_done = None
+        self._need_idle_publish = False
+        self._countdown_remaining = 0
+        # Publish one zero Twist right now for fastest possible motor response.
         self.pub_vel.publish(Twist())
         self.current_action = "idle"
 
@@ -910,20 +955,16 @@ class JarvisAgent(Node):
         speed = self.get_parameter('linear_speed').value
         if direction in ["back", "backward"]:
             speed = -speed
-        self.current_action = f"moving {direction}"
-        twist = Twist()
-        twist.linear.x = float(speed)
-        self._run_timed_motion(twist, duration)
+        twist = self._make_twist(lin=speed)
+        self._enqueue_motion([(twist, duration, None)], f"moving {direction}")
 
     def execute_turn(self, direction: str, duration: float):
         duration = max(0.1, min(duration, 30.0))
         speed = self.get_parameter('angular_speed').value
         if direction == "right":
             speed = -speed
-        self.current_action = f"turning {direction}"
-        twist = Twist()
-        twist.angular.z = float(speed)
-        self._run_timed_motion(twist, duration)
+        twist = self._make_twist(ang=speed)
+        self._enqueue_motion([(twist, duration, None)], f"turning {direction}")
 
     def execute_circle(self, direction: str, duration: float):
         duration = max(0.5, min(duration, 60.0))
@@ -931,112 +972,139 @@ class JarvisAgent(Node):
         ang_speed = self.get_parameter('angular_speed').value * 0.8
         if direction == "right":
             ang_speed = -ang_speed
-        self.current_action = f"circling {direction}"
-        twist = Twist()
-        twist.linear.x = float(lin_speed)
-        twist.angular.z = float(ang_speed)
-        self._run_timed_motion(twist, duration)
+        twist = self._make_twist(lin=lin_speed, ang=ang_speed)
+        self._enqueue_motion([(twist, duration, None)], f"circling {direction}")
 
     def execute_dance(self):
-        self.current_action = "dancing"
         moves = [(1.0, 0.0, 0.5), (-1.0, 0.0, 0.5), (0.0, 2.0, 0.5), (0.0, -2.0, 0.5),
                  (1.0, 1.5, 1.0), (-1.0, -1.5, 1.0), (0.0, 3.0, 1.0)]
-        for lin, ang, dur in moves:
-            if self.cancel_motion:
-                break
-            twist = Twist()
-            twist.linear.x = lin
-            twist.angular.z = ang
-            self._run_timed_motion(twist, dur)
-        self._speak("Dance complete!")
-        self.current_action = "idle"
+        segments = [self._segment(lin, ang, dur) for (lin, ang, dur) in moves]
+        self._attach_on_done(segments, self._compound_done_cb("Dance complete!"))
+        self._enqueue_motion(segments, "dancing")
 
     def execute_patrol(self):
-        self.current_action = "patrolling"
-        for i in range(4):
-            if self.cancel_motion:
-                break
-            twist = Twist()
-            twist.linear.x = self.get_parameter('linear_speed').value
-            self._run_timed_motion(twist, 2.0)
-            twist = Twist()
-            twist.angular.z = self.get_parameter('angular_speed').value
-            self._run_timed_motion(twist, 1.05)
-        self._speak("Patrol complete!")
-        self.current_action = "idle"
+        lin_speed = self.get_parameter('linear_speed').value
+        ang_speed = self.get_parameter('angular_speed').value
+        segments: List[MotionSegment] = []
+        for _ in range(4):
+            segments.append(self._segment(lin_speed, 0.0, 2.0))
+            segments.append(self._segment(0.0, ang_speed, 1.05))
+        self._attach_on_done(segments, self._compound_done_cb("Patrol complete!"))
+        self._enqueue_motion(segments, "patrolling")
 
     def execute_explore(self):
-        self.current_action = "exploring"
-        for i in range(8):
-            if self.cancel_motion:
-                break
-            twist = Twist()
-            twist.linear.x = random.uniform(0.5, 1.5)
-            self._run_timed_motion(twist, random.uniform(0.5, 1.5))
-            twist = Twist()
-            twist.angular.z = random.uniform(-2.0, 2.0)
-            self._run_timed_motion(twist, random.uniform(0.3, 1.0))
-        self._speak("Exploration complete!")
-        self.current_action = "idle"
+        segments: List[MotionSegment] = []
+        for _ in range(8):
+            segments.append(self._segment(random.uniform(0.5, 1.5), 0.0, random.uniform(0.5, 1.5)))
+            segments.append(self._segment(0.0, random.uniform(-2.0, 2.0), random.uniform(0.3, 1.0)))
+        self._attach_on_done(segments, self._compound_done_cb("Exploration complete!"))
+        self._enqueue_motion(segments, "exploring")
 
     def execute_zigzag(self):
-        self.current_action = "zigzagging"
+        segments: List[MotionSegment] = []
         for i in range(6):
-            if self.cancel_motion:
-                break
-            twist = Twist()
-            twist.linear.x = 1.2
-            twist.angular.z = 1.5 if i % 2 == 0 else -1.5
-            self._run_timed_motion(twist, 0.8)
-        self._speak("Zigzag complete!")
-        self.current_action = "idle"
+            ang = 1.5 if i % 2 == 0 else -1.5
+            segments.append(self._segment(1.2, ang, 0.8))
+        self._attach_on_done(segments, self._compound_done_cb("Zigzag complete!"))
+        self._enqueue_motion(segments, "zigzagging")
 
     def execute_figure8(self):
-        self.current_action = "figure 8"
-        twist = Twist()
-        twist.linear.x = 1.0
-        twist.angular.z = 1.2
-        self._run_timed_motion(twist, 5.0)
-        if not self.cancel_motion:
-            twist = Twist()
-            twist.linear.x = 1.0
-            twist.angular.z = -1.2
-            self._run_timed_motion(twist, 5.0)
-        self._speak("Figure 8 complete!")
-        self.current_action = "idle"
+        segments = [
+            self._segment(1.0, 1.2, 5.0),
+            self._segment(1.0, -1.2, 5.0),
+        ]
+        self._attach_on_done(segments, self._compound_done_cb("Figure 8 complete!"))
+        self._enqueue_motion(segments, "figure 8")
 
     def execute_crazy(self):
-        self.current_action = "going crazy"
-        for i in range(12):
-            if self.cancel_motion:
-                break
-            twist = Twist()
-            twist.linear.x = random.uniform(-2.0, 2.0)
-            twist.angular.z = random.uniform(-3.0, 3.0)
-            self._run_timed_motion(twist, random.uniform(0.2, 0.6))
-        self._speak("That was fun!")
-        self.current_action = "idle"
+        segments: List[MotionSegment] = []
+        for _ in range(12):
+            segments.append(self._segment(
+                random.uniform(-2.0, 2.0),
+                random.uniform(-3.0, 3.0),
+                random.uniform(0.2, 0.6),
+            ))
+        self._attach_on_done(segments, self._compound_done_cb("That was fun!"))
+        self._enqueue_motion(segments, "going crazy")
 
     def execute_barrel_roll(self):
-        """Do a barrel roll (spin twice fast)."""
-        self.current_action = "barrel roll"
-        twist = Twist()
-        twist.angular.z = 4.0  # Fast spin
-        self._run_timed_motion(twist, 3.14)  # About one full rotation
-        self._speak("Barrel roll complete!")
-        self.current_action = "idle"
+        """Do a barrel roll (one fast full spin)."""
+        twist = self._make_twist(ang=4.0)
+        segments = [(twist, 3.14, self._compound_done_cb("Barrel roll complete!"))]
+        self._enqueue_motion(segments, "barrel roll")
 
-    def _run_timed_motion(self, twist: Twist, duration: float):
+    # ---- Motion queue plumbing -------------------------------------------
+
+    def _make_twist(self, lin: float = 0.0, ang: float = 0.0) -> Twist:
+        t = Twist()
+        t.linear.x = float(lin)
+        t.angular.z = float(ang)
+        return t
+
+    def _segment(self, lin: float, ang: float, dur: float) -> MotionSegment:
+        return (self._make_twist(lin=lin, ang=ang), float(dur), None)
+
+    def _attach_on_done(self, segments: List[MotionSegment],
+                        on_done: Callable[[], None]) -> None:
+        """Attach a completion callback to the last segment in the list."""
+        if not segments:
+            return
+        last_twist, last_dur, _ = segments[-1]
+        segments[-1] = (last_twist, last_dur, on_done)
+
+    def _compound_done_cb(self, message: str) -> Callable[[], None]:
+        """Build an on_done callback that speaks `message` and returns to idle."""
+        def _cb():
+            self._speak(message)
+            self.current_action = "idle"
+        return _cb
+
+    def _enqueue_motion(self, segments: List[MotionSegment], action_label: str) -> None:
+        """Replace any queued motion with the given segments (last-command-wins)."""
+        self._motion_queue.clear()
+        self._current_twist = None
+        self._motion_deadline = None
+        self._current_on_done = None
         self.cancel_motion = False
-        end_time = time.time() + duration
-        while time.time() < end_time:
-            if self.cancel_motion:
-                self.pub_vel.publish(Twist())
-                self.current_action = "idle"
-                return
-            self.pub_vel.publish(twist)
-            rclpy.spin_once(self, timeout_sec=0.02)
-        self.pub_vel.publish(Twist())
+        self.current_action = action_label
+        for seg in segments:
+            self._motion_queue.append(seg)
+
+    def _motion_tick(self):
+        """50 Hz timer: advance the motion queue and republish the current twist."""
+        now = time.time()
+
+        # Current segment finished? Advance it.
+        if (self._current_twist is not None
+                and self._motion_deadline is not None
+                and now >= self._motion_deadline):
+            on_done = self._current_on_done
+            self._current_twist = None
+            self._motion_deadline = None
+            self._current_on_done = None
+            self._need_idle_publish = True
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception as e:
+                    self.get_logger().warn(f"Motion on_done failed: {e}")
+
+        # Start next segment if we're idle and the queue has more work.
+        if self._current_twist is None and self._motion_queue:
+            twist, duration, on_done = self._motion_queue.popleft()
+            self._current_twist = twist
+            self._motion_deadline = now + max(0.0, duration)
+            self._current_on_done = on_done
+            self._need_idle_publish = False
+
+        # Publish: current segment if active, else a single zero-twist on the
+        # tick we transitioned to idle (gives the motor driver a clean stop and
+        # avoids spamming the bus while truly idle).
+        if self._current_twist is not None:
+            self.pub_vel.publish(self._current_twist)
+        elif self._need_idle_publish:
+            self.pub_vel.publish(Twist())
+            self._need_idle_publish = False
 
 
 def main():
