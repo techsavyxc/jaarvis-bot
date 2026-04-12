@@ -17,13 +17,28 @@ def generate_launch_description():
         LogInfo(msg="  JARVIS-BOT - FULL ROBOT WITH VOICE"),
         LogInfo(msg="=" * 60),
 
-        # Motor Driver
+        # LIDAR Obstacle Detection (publishes /jarvis/lidar/zones)
+        Node(
+            package='jarvis_agent',
+            executable='lidar_node',
+            name='lidar_node',
+            output='screen',
+            parameters=[{
+                'port': '/dev/ttyUSB0',
+                'publish_rate': 10.0,
+            }]
+        ),
+
+        # Motor Driver (subscribes to /jarvis/lidar/zones for safety veto)
         Node(
             package='jarvis_agent',
             executable='motor_driver',
             name='motor_driver',
             output='screen',
-            parameters=[{'simulation_mode': False}],
+            parameters=[{
+                'simulation_mode': False,
+                'safety_enabled': True,
+            }],
             remappings=[('/cmd_vel', '/turtle1/cmd_vel')]
         ),
 

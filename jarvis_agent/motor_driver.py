@@ -20,11 +20,13 @@ Wiring (adjust pins as needed):
     RIGHT_PWM      = Pin 33
 """
 
+import json
+import time
+
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
-import time
 
 # Try to import GPIO (will only work on Jetson)
 try:
@@ -73,6 +75,31 @@ class MotorDriver(Node):
         # === Publisher for status ===
         self.pub_status = self.create_publisher(String, '/jarvis/motor_status', 10)
 
+        # === LIDAR safety gate ===
+        # When enabled, forward-linear commands are clamped to 0 if the LIDAR
+        # front zone reports DANGER.  Turning is always allowed so the
+        # operator/agent can steer away from the obstacle.
+        # Fail-safe: if no LIDAR data has ever arrived, the gate is disabled
+        # (i.e. we never block when the LIDAR node is not running).
+        self.declare_parameter('safety_enabled', True)
+        self.declare_parameter('lidar_zones_topic', '/jarvis/lidar/zones')
+        self.declare_parameter('lidar_stale_seconds', 1.0)
+
+        self.safety_enabled = self.get_parameter('safety_enabled').value
+        lidar_topic = self.get_parameter('lidar_zones_topic').value
+        self.lidar_stale_seconds = float(
+            self.get_parameter('lidar_stale_seconds').value
+        )
+
+        self._last_zones: dict = {}
+        self._last_zones_stamp: float = 0.0
+        self._vetoing_forward = False
+
+        if self.safety_enabled:
+            self.sub_lidar = self.create_subscription(
+                String, lidar_topic, self._on_lidar_zones, 10
+            )
+
         # === Safety: Stop motors if no command received ===
         self.last_cmd_time = time.time()
         self.timeout_timer = self.create_timer(0.5, self.check_timeout)
@@ -80,6 +107,7 @@ class MotorDriver(Node):
         self.get_logger().info("=" * 50)
         self.get_logger().info("  JARVIS MOTOR DRIVER INITIALIZED")
         self.get_logger().info(f"  Simulation Mode: {self.simulation_mode}")
+        self.get_logger().info(f"  LIDAR Safety Gate: {self.safety_enabled}")
         self.get_logger().info("=" * 50)
 
     def _setup_gpio(self):
@@ -105,12 +133,61 @@ class MotorDriver(Node):
 
         self.get_logger().info("GPIO initialized successfully!")
 
+    # ---- LIDAR safety gate --------------------------------------------------
+
+    def _on_lidar_zones(self, msg: String):
+        """Cache the latest zone status from lidar_node."""
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        self._last_zones = data.get("zones", {})
+        self._last_zones_stamp = time.time()
+
+    def _is_forward_blocked(self) -> bool:
+        """Return True if the front zone LIDAR reading is at DANGER level.
+
+        Returns False (= allow motion) when:
+          - safety is disabled
+          - no LIDAR data has been received yet (fail-safe)
+          - LIDAR data is stale (sensor may have disconnected)
+        """
+        if not self.safety_enabled:
+            return False
+        if not self._last_zones:
+            return False  # no data yet — don't block
+        if time.time() - self._last_zones_stamp > self.lidar_stale_seconds:
+            return False  # stale — don't block
+        front = self._last_zones.get("front", {})
+        return front.get("level") == "DANGER"
+
+    # ---- Velocity handling ---------------------------------------------------
+
     def on_cmd_vel(self, msg: Twist):
-        """Handle velocity commands."""
+        """Handle velocity commands, with LIDAR safety gate."""
         self.last_cmd_time = time.time()
 
         linear = msg.linear.x   # Forward/backward (-1 to 1 ish)
         angular = msg.angular.z  # Turn (-1 to 1 ish)
+
+        # LIDAR safety: clamp forward motion to 0 when front zone is DANGER.
+        # Angular velocity always passes so the robot can turn away.
+        if linear > 0 and self._is_forward_blocked():
+            if not self._vetoing_forward:
+                self.get_logger().warn(
+                    "LIDAR veto: forward motion blocked (front DANGER zone)."
+                )
+                self.pub_status.publish(
+                    String(data="LIDAR_VETO: forward blocked")
+                )
+                self._vetoing_forward = True
+            linear = 0.0
+        else:
+            if self._vetoing_forward:
+                self.get_logger().info(
+                    "LIDAR veto cleared: forward motion allowed."
+                )
+                self._vetoing_forward = False
 
         # Convert to left/right wheel speeds (differential drive)
         left_speed = linear - angular * 0.5

@@ -180,6 +180,88 @@ class LidarScanner:
         print("RPLIDAR stopped")
 
 
+if ROS_AVAILABLE:
+    class LidarNode(Node):
+        """ROS 2 wrapper around LidarScanner.
+
+        Publishes zone-distance summaries to /jarvis/lidar/zones as a JSON
+        std_msgs/String at `publish_rate` Hz. Downstream nodes (in particular
+        motor_driver) subscribe to this topic and use it as a safety signal.
+        """
+
+        def __init__(self):
+            super().__init__('lidar_node')
+            self.declare_parameter('port', '/dev/ttyUSB0')
+            self.declare_parameter('publish_rate', 10.0)
+            self.declare_parameter('topic', '/jarvis/lidar/zones')
+
+            port = self.get_parameter('port').value
+            topic = self.get_parameter('topic').value
+            rate = max(1.0, float(self.get_parameter('publish_rate').value))
+
+            self.scanner = LidarScanner(port=port)
+            if not self.scanner.start():
+                self.get_logger().error(
+                    f"Failed to start RPLIDAR on {port}; node is up but will "
+                    f"publish nothing until the device is reachable."
+                )
+
+            self.pub_zones = self.create_publisher(String, topic, 10)
+            self.timer = self.create_timer(1.0 / rate, self._publish_zones)
+            self.get_logger().info(
+                f"LidarNode publishing zone status on {topic} at {rate:.1f} Hz"
+            )
+
+        def _publish_zones(self):
+            if not self.scanner.scan_data:
+                return  # no scan yet — stay silent rather than publish noise
+
+            status = self.scanner.get_zone_status()
+            closest_zone, closest_mm = self.scanner.get_closest_obstacle()
+            payload = {
+                "stamp": time.time(),
+                "closest_zone": closest_zone,
+                "closest_mm": (closest_mm if closest_mm != float('inf') else -1),
+                "zones": {
+                    name: {
+                        "distance_mm": s["distance"],
+                        "level": s["level"],
+                    }
+                    for name, s in status.items()
+                },
+            }
+            self.pub_zones.publish(String(data=json.dumps(payload)))
+
+        def destroy(self):
+            try:
+                self.scanner.stop()
+            except Exception:
+                pass
+            super().destroy_node()
+
+
+def main():
+    """Entry point used by ros2 run / setup.py console_scripts.
+
+    Prefers the ROS node; falls back to the standalone matplotlib viewer only
+    when rclpy is unavailable (e.g. dev machine without ROS).
+    """
+    if not ROS_AVAILABLE:
+        print("rclpy not available; launching standalone matplotlib viewer.")
+        main_standalone()
+        return
+
+    rclpy.init()
+    node = LidarNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy()
+        rclpy.shutdown()
+
+
 def main_standalone():
     """Run with visualization (no ROS)."""
     import matplotlib.pyplot as plt
@@ -293,4 +375,4 @@ def main_standalone():
 
 
 if __name__ == '__main__':
-    main_standalone()
+    main()
