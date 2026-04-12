@@ -329,16 +329,12 @@ class JarvisAgent(Node):
         self.get_logger().info("=" * 50)
 
     def _speak(self, text: str):
-        """Text-to-speech using Piper (natural voice)."""
+        """Text-to-speech via the shared voice_utils helper (injection-safe)."""
         if not self.get_parameter('voice_enabled').value:
             return
         try:
-            import subprocess
-            import os
-            piper_path = os.path.expanduser("~/piper/piper")
-            model_path = os.path.expanduser("~/piper-voices/en_US-lessac-medium.onnx")
-            cmd = f'echo "{text}" | {piper_path} --model {model_path} --output-raw | aplay -r 22050 -f S16_LE -t raw - 2>/dev/null'
-            subprocess.Popen(cmd, shell=True)
+            from jarvis_agent.voice_utils import speak
+            speak(text)
         except Exception as e:
             self.get_logger().warn(f"Speech failed: {e}")
 
