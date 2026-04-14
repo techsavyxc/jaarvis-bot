@@ -37,12 +37,17 @@ class JarvisAgent(Node):
         # Subscribers
         self.sub_intent = self.create_subscription(String, '/jarvis/intent', self.on_intent, 10)
         self.sub_pose = self.create_subscription(Pose, '/turtle1/pose', self.on_pose, 10)
+        self.sub_vision = self.create_subscription(
+            String, '/jarvis/vision/person', self._on_vision, 10
+        )
 
         # Parameters
         self.declare_parameter('linear_speed', 1.5)
         self.declare_parameter('angular_speed', 1.5)
         self.declare_parameter('voice_enabled', True)
         self.declare_parameter('voice_engine', 'espeak')  # espeak, piper, or mimic
+        self.declare_parameter('follow_lost_timeout', 1.5)  # s before stopping when person disappears
+        self.declare_parameter('follow_tick_hz', 10.0)
 
         # State
         self.pose: Optional[Pose] = None
@@ -72,6 +77,14 @@ class JarvisAgent(Node):
         # 1 Hz timer that is a no-op when _countdown_remaining == 0.
         self._countdown_remaining = 0
         self._countdown_timer = self.create_timer(1.0, self._countdown_tick)
+
+        # === Follow-me state (fed by /jarvis/vision/person) ===
+        self._vision_latest: Optional[dict] = None
+        self._vision_stamp: float = 0.0
+        follow_hz = max(1.0, float(self.get_parameter('follow_tick_hz').value))
+        self._follow_lost_timeout = float(self.get_parameter('follow_lost_timeout').value)
+        self._follow_timer = self.create_timer(1.0 / follow_hz, self._follow_tick)
+        self._follow_was_lost = False  # for one-shot logging
         
         # === MEMORY SYSTEM ===
         self.memory = {
@@ -544,13 +557,13 @@ class JarvisAgent(Node):
         elif action == "fortune":
             self.tell_fortune()
 
-        # === FOLLOW (Future vision integration) ===
+        # === FOLLOW (vision-driven) ===
         elif action == "follow":
             self.toggle_follow_mode()
         elif action == "find_person":
-            self._speak("Looking for you... I'll need my camera connected to actually see you!")
+            self.find_person()
         elif action == "scan":
-            self._speak("Scanning the area... Vision module coming soon!")
+            self.scan_environment()
             
         # === SAY ===
         elif action == "say":
@@ -632,6 +645,54 @@ class JarvisAgent(Node):
         self._countdown_remaining -= 1
         if self._countdown_remaining == 0:
             self._speak("Blast off!")
+
+    # ---- Follow-me ---------------------------------------------------------
+
+    def _on_vision(self, msg: String):
+        """Cache the latest pose from vision_node."""
+        try:
+            self._vision_latest = json.loads(msg.data)
+            self._vision_stamp = time.time()
+        except json.JSONDecodeError:
+            pass
+
+    def _follow_tick(self):
+        """Drive /cmd_vel from the latest vision pose while follow_mode is on.
+
+        Only runs when follow_mode is True. Respects the motion queue: if the
+        user issues an explicit move/turn command the queue takes priority,
+        which is why we don't publish from here while a queued segment is
+        active. If the person is lost for longer than ``follow_lost_timeout``
+        we stop and emit a one-shot warning so the operator knows why.
+        """
+        if not self.follow_mode:
+            return
+
+        # Don't fight an in-progress queued motion (e.g. the user said "turn
+        # left" while follow mode is on — let that finish first).
+        if self._current_twist is not None or self._motion_queue:
+            return
+
+        stale = (time.time() - self._vision_stamp) > self._follow_lost_timeout
+        detected = bool(self._vision_latest and self._vision_latest.get("detected"))
+
+        if stale or not detected:
+            if not self._follow_was_lost:
+                self._follow_was_lost = True
+                self._status("Follow mode: person lost — holding position.")
+            # Publish a zero-twist so any previously held velocity is cleared.
+            self.pub_vel.publish(Twist())
+            return
+
+        if self._follow_was_lost:
+            self._follow_was_lost = False
+            self._status("Follow mode: person reacquired.")
+
+        cmd = self._vision_latest.get("follow_cmd", {})
+        twist = Twist()
+        twist.linear.x = float(cmd.get("linear", 0.0))
+        twist.angular.z = float(cmd.get("angular", 0.0))
+        self.pub_vel.publish(twist)
 
     def do_math(self, num1: int, operator: str, num2: int):
         """Calculate math."""
@@ -733,13 +794,50 @@ class JarvisAgent(Node):
         self._status("Gave help")
 
     def toggle_follow_mode(self):
-        """Toggle follow mode."""
+        """Toggle vision-driven follow mode."""
         self.follow_mode = not self.follow_mode
         if self.follow_mode:
-            self._speak("Follow mode activated! I'll follow you when my camera is connected.")
+            self._follow_was_lost = False
+            if self._vision_latest is None:
+                self._speak(
+                    "Follow mode on, but I can't see the camera feed yet. "
+                    "Make sure the vision node is running."
+                )
+            else:
+                self._speak("Follow mode activated. I'm watching for you now.")
         else:
+            # Stop the wheels immediately on disable.
+            self.pub_vel.publish(Twist())
             self._speak("Follow mode deactivated.")
         self._status(f"Follow mode: {self.follow_mode}")
+
+    def find_person(self):
+        """Report whether the vision node currently sees a person."""
+        if self._vision_latest is None:
+            self._speak("I'm not receiving any camera data yet.")
+            return
+        if self._vision_latest.get("detected"):
+            dist = float(self._vision_latest.get("distance", 0.0))
+            if dist > 0:
+                self._speak(f"I see you, about {dist:.1f} metres in front of me.")
+            else:
+                self._speak("I see you, but I can't measure the distance right now.")
+        else:
+            self._speak("I don't see anyone at the moment.")
+        self._status("find_person responded")
+
+    def scan_environment(self):
+        """Describe what the vision pipeline can currently see."""
+        if self._vision_latest is None:
+            self._speak("Scanning... but my camera isn't online yet.")
+            return
+        if self._vision_latest.get("detected"):
+            x = float(self._vision_latest.get("x", 0.0))
+            side = "to my left" if x < -0.15 else ("to my right" if x > 0.15 else "right in front of me")
+            self._speak(f"Scan complete. I see a person {side}.")
+        else:
+            self._speak("Scan complete. The area looks clear.")
+        self._status("scan_environment responded")
 
     # ==================== EXISTING FUN COMMANDS ====================
 
@@ -942,6 +1040,9 @@ class JarvisAgent(Node):
         self._current_on_done = None
         self._need_idle_publish = False
         self._countdown_remaining = 0
+        # Any "stop" command also exits follow mode so the robot doesn't
+        # immediately start chasing again on the next follow_tick.
+        self.follow_mode = False
         # Publish one zero Twist right now for fastest possible motor response.
         self.pub_vel.publish(Twist())
         self.current_action = "idle"

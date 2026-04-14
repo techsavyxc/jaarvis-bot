@@ -75,6 +75,17 @@ def generate_launch_description():
             }]
         ),
 
+        # Vision Node (publishes /jarvis/vision/person; feeds follow-me)
+        Node(
+            package='jarvis_agent',
+            executable='vision_node',
+            name='vision_node',
+            output='screen',
+            parameters=[{
+                'publish_rate': 10.0,
+            }]
+        ),
+
         # Telemetry Logger
         Node(
             package='jarvis_agent',

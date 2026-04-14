@@ -40,6 +40,7 @@ setup(
             'voice_node = jarvis_agent.voice_node:main',
             'motor_driver = jarvis_agent.motor_driver:main',
             'lidar_node = jarvis_agent.lidar_node:main',
+            'vision_node = jarvis_agent.vision_node:main',
         ],
     },
 )
