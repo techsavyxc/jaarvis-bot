@@ -34,9 +34,23 @@ def generate_launch_description():
         description='Ollama API host'
     )
 
+    demo_safe_arg = DeclareLaunchArgument(
+        'demo_safe_mode',
+        default_value='false',
+        description='Start in demo-safe mode (bypass Ollama, rule-based parser only)'
+    )
+
+    failure_threshold_arg = DeclareLaunchArgument(
+        'failure_threshold',
+        default_value='3',
+        description='Consecutive LLM failures before auto-engaging demo-safe mode'
+    )
+
     return LaunchDescription([
         model_arg,
         ollama_host_arg,
+        demo_safe_arg,
+        failure_threshold_arg,
 
         LogInfo(msg="=" * 60),
         LogInfo(msg="  JARVIS-BOT SIMULATION (LLM-Powered)"),
@@ -60,7 +74,8 @@ def generate_launch_description():
                 'model': LaunchConfiguration('model'),
                 'ollama_host': LaunchConfiguration('ollama_host'),
                 'timeout': 10.0,
-                'fallback_enabled': True  # Use rule-based if LLM fails
+                'demo_safe_mode': LaunchConfiguration('demo_safe_mode'),
+                'failure_threshold': LaunchConfiguration('failure_threshold'),
             }]
         ),
 
