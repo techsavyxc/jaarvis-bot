@@ -1,279 +1,253 @@
 #!/usr/bin/env python3
 """
-Jarvis Motor Driver Node
-========================
-Controls real motors on the 4WD chassis via GPIO.
+Jarvis Motor Driver Node - Wave Rover Serial Version with LIDAR Obstacle Veto
 
-This node subscribes to /cmd_vel (Twist messages) and
-converts them to motor commands.
+- Subscribes to /jarvis/intent  : drive commands from agent
+- Subscribes to /jarvis/lidar/zones : 8-zone obstacle classification
+- Publishes  to /jarvis/motor/blocked : notifies agent when a move is vetoed
+- Sends      to Wave Rover via /dev/ttyUSB1 as JSON
 
-For Jetson Nano/Orin with L298N or similar motor driver:
-- Uses GPIO pins for motor control
-- Supports PWM for speed control
+Obstacle veto rules (direction-aware):
+  forward   -> blocks if any of [front, front_left, front_right] is DANGER
+  backward  -> blocks if any of [back,  back_left,  back_right]  is DANGER
+  left      -> blocks if any of [front_left,  left]              is DANGER
+  right     -> blocks if any of [front_right, right]             is DANGER
+  spin/dance-> blocks if ANY zone is DANGER (full sweep)
+  WARNING level is logged but allowed.
 
-Wiring (adjust pins as needed):
-    LEFT_FORWARD   = Pin 11
-    LEFT_BACKWARD  = Pin 13
-    RIGHT_FORWARD  = Pin 15
-    RIGHT_BACKWARD = Pin 16
-    LEFT_PWM       = Pin 32
-    RIGHT_PWM      = Pin 33
+Fail-OPEN behavior: if no LIDAR data has been received yet, or LIDAR data
+is stale (>1.5s old), movement is allowed but a warning is logged. This
+prevents a brief LIDAR hiccup from killing the demo.
 """
-
 import json
 import time
-
+import serial
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 
-# Try to import GPIO (will only work on Jetson)
-try:
-    import Jetson.GPIO as GPIO
-    GPIO_AVAILABLE = True
-except ImportError:
-    GPIO_AVAILABLE = False
-    print("WARNING: Jetson.GPIO not available. Running in simulation mode.")
+
+# Movement direction -> which zones must be clear of DANGER
+DIRECTION_ZONES = {
+    'forward':    ['front', 'front_left', 'front_right'],
+    'backward':   ['back',  'back_left',  'back_right'],
+    'back':       ['back',  'back_left',  'back_right'],
+    'left':       ['front_left',  'left'],
+    'turn left':  ['front_left',  'left'],
+    'right':      ['front_right', 'right'],
+    'turn right': ['front_right', 'right'],
+}
+
+ALL_ZONES = ['front', 'front_left', 'front_right', 'right',
+             'back_right', 'back', 'back_left', 'left']
 
 
 class MotorDriver(Node):
     def __init__(self):
         super().__init__('motor_driver')
 
-        # === GPIO Pin Configuration ===
-        self.declare_parameter('left_forward_pin', 11)
-        self.declare_parameter('left_backward_pin', 13)
-        self.declare_parameter('right_forward_pin', 15)
-        self.declare_parameter('right_backward_pin', 16)
-        self.declare_parameter('left_pwm_pin', 32)
-        self.declare_parameter('right_pwm_pin', 33)
-        self.declare_parameter('max_speed', 100)  # PWM duty cycle (0-100)
-        self.declare_parameter('simulation_mode', not GPIO_AVAILABLE)
+        # ----- Parameters -----
+        self.declare_parameter('port', '/dev/ttyUSB1')
+        self.declare_parameter('baudrate', 115200)
+        self.declare_parameter('simulation_mode', False)
+        self.declare_parameter('obstacle_check_enabled', True)
+        self.declare_parameter('zones_stale_timeout_s', 1.5)
 
-        # Get parameters
-        self.LEFT_FWD = self.get_parameter('left_forward_pin').value
-        self.LEFT_BWD = self.get_parameter('left_backward_pin').value
-        self.RIGHT_FWD = self.get_parameter('right_forward_pin').value
-        self.RIGHT_BWD = self.get_parameter('right_backward_pin').value
-        self.LEFT_PWM = self.get_parameter('left_pwm_pin').value
-        self.RIGHT_PWM = self.get_parameter('right_pwm_pin').value
-        self.MAX_SPEED = self.get_parameter('max_speed').value
-        self.simulation_mode = self.get_parameter('simulation_mode').value
+        self.sim_mode = self.get_parameter('simulation_mode').value
+        port = self.get_parameter('port').value
+        baudrate = self.get_parameter('baudrate').value
+        self.obstacle_check_enabled = self.get_parameter('obstacle_check_enabled').value
+        self.zones_stale_timeout = self.get_parameter('zones_stale_timeout_s').value
 
-        # === Setup GPIO ===
-        if GPIO_AVAILABLE and not self.simulation_mode:
-            self._setup_gpio()
-        else:
-            self.get_logger().warn("Running in SIMULATION MODE (no real motors)")
+        # ----- Serial connection to Wave Rover -----
+        self.ser = None
+        if not self.sim_mode:
+            try:
+                self.ser = serial.Serial(port, baudrate, timeout=1)
+                time.sleep(2)
+                self.get_logger().info(f'✅ Connected to Wave Rover on {port}')
+            except Exception as e:
+                self.get_logger().error(f'❌ Serial connection failed: {e}')
+                self.sim_mode = True
 
-        # === Subscribers ===
-        self.sub_cmd = self.create_subscription(
-            Twist, '/cmd_vel', self.on_cmd_vel, 10
+        if self.sim_mode:
+            self.get_logger().warn('⚠️  Running in simulation mode - no serial')
+
+        # ----- LIDAR zones cache -----
+        self.latest_zones = None
+        self.latest_zones_time = 0.0
+
+        # ----- Subscriptions -----
+        self.intent_sub = self.create_subscription(
+            String, '/jarvis/intent', self.intent_callback, 10)
+
+        self.zones_sub = self.create_subscription(
+            String, '/jarvis/lidar/zones', self.zones_callback, 10)
+
+        # ----- Publisher: notify agent on vetoed movement -----
+        self.blocked_pub = self.create_publisher(
+            String, '/jarvis/motor/blocked', 10)
+
+        veto_state = 'ENABLED' if self.obstacle_check_enabled else 'DISABLED'
+        self.get_logger().info(
+            f'🚗 Motor Driver ready - obstacle veto: {veto_state}'
         )
+        self.get_logger().info('   Listening on /jarvis/intent')
+        self.get_logger().info('   Listening on /jarvis/lidar/zones')
 
-        # === Publisher for status ===
-        self.pub_status = self.create_publisher(String, '/jarvis/motor_status', 10)
-
-        # === LIDAR safety gate ===
-        # When enabled, forward-linear commands are clamped to 0 if the LIDAR
-        # front zone reports DANGER.  Turning is always allowed so the
-        # operator/agent can steer away from the obstacle.
-        # Fail-safe: if no LIDAR data has ever arrived, the gate is disabled
-        # (i.e. we never block when the LIDAR node is not running).
-        self.declare_parameter('safety_enabled', True)
-        self.declare_parameter('lidar_zones_topic', '/jarvis/lidar/zones')
-        self.declare_parameter('lidar_stale_seconds', 1.0)
-
-        self.safety_enabled = self.get_parameter('safety_enabled').value
-        lidar_topic = self.get_parameter('lidar_zones_topic').value
-        self.lidar_stale_seconds = float(
-            self.get_parameter('lidar_stale_seconds').value
-        )
-
-        self._last_zones: dict = {}
-        self._last_zones_stamp: float = 0.0
-        self._vetoing_forward = False
-
-        if self.safety_enabled:
-            self.sub_lidar = self.create_subscription(
-                String, lidar_topic, self._on_lidar_zones, 10
-            )
-
-        # === Safety: Stop motors if no command received ===
-        self.last_cmd_time = time.time()
-        self.timeout_timer = self.create_timer(0.5, self.check_timeout)
-
-        self.get_logger().info("=" * 50)
-        self.get_logger().info("  JARVIS MOTOR DRIVER INITIALIZED")
-        self.get_logger().info(f"  Simulation Mode: {self.simulation_mode}")
-        self.get_logger().info(f"  LIDAR Safety Gate: {self.safety_enabled}")
-        self.get_logger().info("=" * 50)
-
-    def _setup_gpio(self):
-        """Initialize GPIO pins."""
-        GPIO.setmode(GPIO.BOARD)
-        GPIO.setwarnings(False)
-
-        # Setup direction pins
-        GPIO.setup(self.LEFT_FWD, GPIO.OUT)
-        GPIO.setup(self.LEFT_BWD, GPIO.OUT)
-        GPIO.setup(self.RIGHT_FWD, GPIO.OUT)
-        GPIO.setup(self.RIGHT_BWD, GPIO.OUT)
-
-        # Setup PWM pins
-        GPIO.setup(self.LEFT_PWM, GPIO.OUT)
-        GPIO.setup(self.RIGHT_PWM, GPIO.OUT)
-
-        # Create PWM objects (1000 Hz frequency)
-        self.left_pwm = GPIO.PWM(self.LEFT_PWM, 1000)
-        self.right_pwm = GPIO.PWM(self.RIGHT_PWM, 1000)
-        self.left_pwm.start(0)
-        self.right_pwm.start(0)
-
-        self.get_logger().info("GPIO initialized successfully!")
-
-    # ---- LIDAR safety gate --------------------------------------------------
-
-    def _on_lidar_zones(self, msg: String):
-        """Cache the latest zone status from lidar_node."""
+    # ---------- LIDAR ----------
+    def zones_callback(self, msg):
         try:
             data = json.loads(msg.data)
-        except json.JSONDecodeError:
+            self.latest_zones = data.get('zones', {})
+            self.latest_zones_time = time.time()
+        except Exception as e:
+            self.get_logger().warn(f'Bad zones msg: {e}')
+
+    def is_path_clear(self, direction):
+        """Returns (clear: bool, reason: str). Fail-OPEN on missing/stale data."""
+        if not self.obstacle_check_enabled:
+            return True, ''
+
+        if direction == 'all':
+            zones_to_check = ALL_ZONES
+        else:
+            zones_to_check = DIRECTION_ZONES.get(direction)
+            if zones_to_check is None:
+                return True, ''  # unknown direction, no veto
+
+        # No data yet -> fail open with warning
+        if self.latest_zones is None:
+            self.get_logger().warn(
+                '⚠️  No LIDAR data yet — moving without obstacle check'
+            )
+            return True, ''
+
+        # Stale data -> fail open with warning
+        age = time.time() - self.latest_zones_time
+        if age > self.zones_stale_timeout:
+            self.get_logger().warn(
+                f'⚠️  LIDAR data stale ({age:.1f}s) — moving without obstacle check'
+            )
+            return True, ''
+
+        # Check zones for DANGER
+        blocked = []
+        warnings = []
+        for zone in zones_to_check:
+            zd = self.latest_zones.get(zone, {})
+            level = zd.get('level', 'CLEAR')
+            dist = zd.get('distance_mm', -1)
+            if level == 'DANGER':
+                blocked.append(f'{zone}({dist:.0f}mm)')
+            elif level == 'WARNING':
+                warnings.append(f'{zone}({dist:.0f}mm)')
+
+        if warnings:
+            self.get_logger().info(f'⚠️  Caution — close: {", ".join(warnings)}')
+
+        if blocked:
+            return False, f'obstacle in {", ".join(blocked)}'
+        return True, ''
+
+    def publish_blocked(self, direction, reason):
+        msg = String()
+        msg.data = json.dumps({
+            'direction': direction,
+            'reason': reason,
+            'stamp': time.time(),
+        })
+        self.blocked_pub.publish(msg)
+        self.get_logger().warn(f'🛑 BLOCKED {direction}: {reason}')
+
+    # ---------- Motor primitives ----------
+    def send_command(self, L, R):
+        cmd = json.dumps({"T": 1, "L": L, "R": R}) + "\n"
+        if self.sim_mode:
+            self.get_logger().info(f'[SIM] Motor cmd: L={L} R={R}')
             return
-        self._last_zones = data.get("zones", {})
-        self._last_zones_stamp = time.time()
+        try:
+            self.ser.write(cmd.encode())
+            self.get_logger().info(f'🚗 Motor cmd: L={L} R={R}')
+        except Exception as e:
+            self.get_logger().error(f'Serial write error: {e}')
 
-    def _is_forward_blocked(self) -> bool:
-        """Return True if the front zone LIDAR reading is at DANGER level.
+    def stop(self):
+        self.send_command(0, 0)
 
-        Returns False (= allow motion) when:
-          - safety is disabled
-          - no LIDAR data has been received yet (fail-safe)
-          - LIDAR data is stale (sensor may have disconnected)
-        """
-        if not self.safety_enabled:
-            return False
-        if not self._last_zones:
-            return False  # no data yet — don't block
-        if time.time() - self._last_zones_stamp > self.lidar_stale_seconds:
-            return False  # stale — don't block
-        front = self._last_zones.get("front", {})
-        return front.get("level") == "DANGER"
+    def execute_move(self, direction, L, R, duration):
+        """Veto-checked movement primitive."""
+        clear, reason = self.is_path_clear(direction)
+        if not clear:
+            self.publish_blocked(direction, reason)
+            self.stop()
+            return
+        self.send_command(L, R)
+        time.sleep(duration)
+        self.stop()
 
-    # ---- Velocity handling ---------------------------------------------------
-
-    def on_cmd_vel(self, msg: Twist):
-        """Handle velocity commands, with LIDAR safety gate."""
-        self.last_cmd_time = time.time()
-
-        linear = msg.linear.x   # Forward/backward (-1 to 1 ish)
-        angular = msg.angular.z  # Turn (-1 to 1 ish)
-
-        # LIDAR safety: clamp forward motion to 0 when front zone is DANGER.
-        # Angular velocity always passes so the robot can turn away.
-        if linear > 0 and self._is_forward_blocked():
-            if not self._vetoing_forward:
-                self.get_logger().warn(
-                    "LIDAR veto: forward motion blocked (front DANGER zone)."
-                )
-                self.pub_status.publish(
-                    String(data="LIDAR_VETO: forward blocked")
-                )
-                self._vetoing_forward = True
-            linear = 0.0
-        else:
-            if self._vetoing_forward:
-                self.get_logger().info(
-                    "LIDAR veto cleared: forward motion allowed."
-                )
-                self._vetoing_forward = False
-
-        # Convert to left/right wheel speeds (differential drive)
-        left_speed = linear - angular * 0.5
-        right_speed = linear + angular * 0.5
-
-        # Normalize to -1 to 1 range
-        max_val = max(abs(left_speed), abs(right_speed), 1.0)
-        left_speed = left_speed / max_val
-        right_speed = right_speed / max_val
-
-        # Apply to motors
-        self._set_motors(left_speed, right_speed)
-
-    def _set_motors(self, left: float, right: float):
-        """
-        Set motor speeds.
-        left/right: -1.0 (full reverse) to 1.0 (full forward)
-        """
-        if self.simulation_mode:
-            self.get_logger().info(f"MOTORS: Left={left:.2f}, Right={right:.2f}")
-            status = f"SIM: L={left:.2f} R={right:.2f}"
-            self.pub_status.publish(String(data=status))
+    # ---------- Intent handler ----------
+    def intent_callback(self, msg):
+        try:
+            intent = json.loads(msg.data)
+        except Exception:
             return
 
-        # Left motor
-        if left > 0:
-            GPIO.output(self.LEFT_FWD, GPIO.HIGH)
-            GPIO.output(self.LEFT_BWD, GPIO.LOW)
-            self.left_pwm.ChangeDutyCycle(abs(left) * self.MAX_SPEED)
-        elif left < 0:
-            GPIO.output(self.LEFT_FWD, GPIO.LOW)
-            GPIO.output(self.LEFT_BWD, GPIO.HIGH)
-            self.left_pwm.ChangeDutyCycle(abs(left) * self.MAX_SPEED)
-        else:
-            GPIO.output(self.LEFT_FWD, GPIO.LOW)
-            GPIO.output(self.LEFT_BWD, GPIO.LOW)
-            self.left_pwm.ChangeDutyCycle(0)
+        action = intent.get('action', '')
+        direction = intent.get('direction', '')
+        duration = float(intent.get('duration', 1.0))
 
-        # Right motor
-        if right > 0:
-            GPIO.output(self.RIGHT_FWD, GPIO.HIGH)
-            GPIO.output(self.RIGHT_BWD, GPIO.LOW)
-            self.right_pwm.ChangeDutyCycle(abs(right) * self.MAX_SPEED)
-        elif right < 0:
-            GPIO.output(self.RIGHT_FWD, GPIO.LOW)
-            GPIO.output(self.RIGHT_BWD, GPIO.HIGH)
-            self.right_pwm.ChangeDutyCycle(abs(right) * self.MAX_SPEED)
-        else:
-            GPIO.output(self.RIGHT_FWD, GPIO.LOW)
-            GPIO.output(self.RIGHT_BWD, GPIO.LOW)
-            self.right_pwm.ChangeDutyCycle(0)
+        self.get_logger().info(f'📨 Intent: action={action} direction={direction}')
 
-        status = f"MOTORS: L={left:.2f} R={right:.2f}"
-        self.pub_status.publish(String(data=status))
+        if action in ('move', 'turn'):
+            if direction == 'forward':
+                self.execute_move('forward', 0.3, 0.3, duration)
+            elif direction in ('backward', 'back'):
+                self.execute_move('backward', -0.3, -0.3, duration)
+            elif direction in ('left', 'turn left'):
+                self.execute_move('left', -0.25, 0.25, duration)
+            elif direction in ('right', 'turn right'):
+                self.execute_move('right', 0.25, -0.25, duration)
 
-    def check_timeout(self):
-        """Stop motors if no command received recently (safety feature)."""
-        if time.time() - self.last_cmd_time > 1.0:
-            self._set_motors(0, 0)
+        elif action == 'stop':
+            self.stop()
 
-    def stop_motors(self):
-        """Stop all motors."""
-        self._set_motors(0, 0)
-        if GPIO_AVAILABLE and not self.simulation_mode:
-            self.left_pwm.ChangeDutyCycle(0)
-            self.right_pwm.ChangeDutyCycle(0)
+        elif action == 'dance':
+            clear, reason = self.is_path_clear('all')
+            if not clear:
+                self.publish_blocked('dance', reason)
+                return
+            for _ in range(3):
+                self.send_command(0.3, -0.3)
+                time.sleep(0.4)
+                self.send_command(-0.3, 0.3)
+                time.sleep(0.4)
+            self.stop()
 
-    def cleanup(self):
-        """Clean up GPIO on shutdown."""
-        self.stop_motors()
-        if GPIO_AVAILABLE and not self.simulation_mode:
-            self.left_pwm.stop()
-            self.right_pwm.stop()
-            GPIO.cleanup()
-        self.get_logger().info("Motor driver shut down cleanly.")
+        elif action == 'spin':
+            clear, reason = self.is_path_clear('all')
+            if not clear:
+                self.publish_blocked('spin', reason)
+                return
+            self.send_command(0.3, -0.3)
+            time.sleep(duration)
+            self.stop()
+
+    def destroy_node(self):
+        self.stop()
+        if self.ser:
+            self.ser.close()
+        super().destroy_node()
 
 
-def main():
-    rclpy.init()
+def main(args=None):
+    rclpy.init(args=args)
     node = MotorDriver()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.cleanup()
         node.destroy_node()
         rclpy.shutdown()
 

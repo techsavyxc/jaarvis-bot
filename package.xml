@@ -20,6 +20,9 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>turtlesim</exec_depend>
+  <exec_depend>rplidar_ros</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>rviz2</exec_depend>
 
   <!-- Python dependencies (installed via pip) -->
   <!-- paho-mqtt: MQTT client -->

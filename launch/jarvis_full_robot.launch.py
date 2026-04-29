@@ -70,7 +70,7 @@ def generate_launch_description():
             name='voice_node',
             output='screen',
             parameters=[{
-                'model_path': '/home/jarvis/vosk-model',
+                'model_path': '/home/cj/vosk-model',
                 'always_listen': True
             }]
         ),

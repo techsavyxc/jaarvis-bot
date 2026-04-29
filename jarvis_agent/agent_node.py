@@ -358,9 +358,9 @@ class JarvisAgent(Node):
             },
         }
 
-        self._speak("Jarvis online and ready, sir! Mega upgraded version at your service!")
+        self._speak("JARVIS online. All systems operational.")
         self.get_logger().info("=" * 50)
-        self.get_logger().info("  JARVIS AGENT - MEGA UPGRADED VERSION")
+        self.get_logger().info("  JARVIS AGENT")
         self.get_logger().info("  Now with games, trivia, and more!")
         self.get_logger().info("=" * 50)
 
